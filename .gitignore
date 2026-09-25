@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets (per Bloodaxe README's per-pipeline .env safety pattern)
+.env
+*.pem
+*.key
+
+# Test artifacts
+.pytest_cache/
+.tox/
+*.egg-info/
+
+# Specs (regenerated daily)
+ragnar_scripts/ragnar_specs/bloodaxe_*.json
+
+# Journal (operator's record)
+journal.jsonl
+
+# OS
+.DS_Store
