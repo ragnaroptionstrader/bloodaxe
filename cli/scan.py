@@ -446,41 +446,78 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     if not chain_ok:
         return {"symbol": sym, "skip_reason": skip_chain_reason}
 
-    # Get quotes for all 4 legs. If target strike has no quote, walk inward
-    # toward spot (up to MAX_STRIKE_FALLBACK steps) to find quoted strikes.
-    # Keeps wing_width intact — both legs of a side shift together.
-    MAX_STRIKE_FALLBACK = 3
+    # Get quotes for all 4 legs. Each leg walks to find its closest quoted
+    # strike. Short legs walk TOWARD spot, long legs walk AWAY from spot
+    # (so they always stay outside their short leg, preserving IC structure).
+    # This handles chains where short + wing_width lands on a mid=0 strike
+    # (e.g. AMD on Tiger paper — even strikes quoted, odd strikes mid=0):
+    # short_call=750 (quoted), long_call walks UP from short_call+5=755 to
+    # 760 (quoted, since 755 is mid=0). Result: wing=10 instead of 5.
+    #
+    # Cost: ~2-3 quote calls per leg, 8-12 total per scan. Tiger paper budget
+    # ~60-120 quotes/min is fine.
+    #
+    # Wing width becomes VARIABLE (may be wider than configured). The actual
+    # wing is used for sizing; if max_loss exceeds the cap, the sizing check
+    # naturally rejects the trade.
+    MAX_STRIKE_FALLBACK = 4
 
-    def _find_leg_pair(target_short, is_call):
-        """Walk inward from target_short until both legs (target, target+wing)
-        have valid quotes. Returns (short_strike, long_strike, short_q, long_q)
-        or (None, None, None, None) on failure."""
-        direction = -1 if is_call else 1  # calls walk down, puts walk up
+    def _walk_quotes(target_strike, walk_dir, is_call):
+        """Walk from target_strike in walk_dir direction (±1 per strike_step).
+        Returns (strike, quote) or (None, None) if no quoted strike within
+        MAX_STRIKE_FALLBACK steps."""
         for step in range(MAX_STRIKE_FALLBACK + 1):
-            sc = target_short + (step * direction * strike_step)
-            lc = sc + wing_width if is_call else sc - wing_width
-            sc_q = broker.get_option_quote(sym, expiry, sc, is_call=is_call)
-            lc_q = broker.get_option_quote(sym, expiry, lc, is_call=is_call)
-            if (sc_q and sc_q.get("mid", 0) > 0 and
-                    lc_q and lc_q.get("mid", 0) > 0):
-                return sc, lc, sc_q, lc_q
-        return None, None, None, None
+            strike = target_strike + (step * walk_dir * strike_step)
+            q = broker.get_option_quote(sym, expiry, strike, is_call=is_call)
+            if q and q.get("mid", 0) > 0:
+                return strike, q
+        return None, None
 
-    sc, lc, sc_q, lc_q = _find_leg_pair(short_call, is_call=True)
-    if sc is None:
+    # Short legs walk TOWARD spot (-1 for calls, +1 for puts).
+    short_call_dir = -1 if True else 1  # calls
+    short_put_dir = +1  # puts
+
+    # Long legs walk AWAY from spot (opposite direction from short).
+    # This guarantees long_call > short_call and short_put > long_put.
+    long_call_dir = +1  # calls walk UP (away from spot)
+    long_put_dir = -1   # puts walk DOWN (away from spot)
+
+    # Calls side
+    short_call_orig = short_call
+    short_call, sc_q = _walk_quotes(short_call, short_call_dir, is_call=True)
+    if short_call is None:
         return {
             "symbol": sym,
-            "skip_reason": f"no_quote_for_call_pair_near_{short_call}"
+            "skip_reason": f"no_quoted_short_call_near_{short_call_orig}"
         }
-    short_call, long_call = sc, lc
-
-    sp, lp, sp_q, lp_q = _find_leg_pair(short_put, is_call=False)
-    if sp is None:
+    long_call, lc_q = _walk_quotes(short_call + wing_width, long_call_dir, is_call=True)
+    if long_call is None or long_call <= short_call:
         return {
             "symbol": sym,
-            "skip_reason": f"no_quote_for_put_pair_near_{short_put}"
+            "skip_reason": f"no_quoted_long_call_near_{short_call + wing_width}"
         }
-    short_put, long_put = sp, lp
+
+    # Puts side
+    short_put_orig = short_put
+    short_put, sp_q = _walk_quotes(short_put, short_put_dir, is_call=False)
+    if short_put is None:
+        return {
+            "symbol": sym,
+            "skip_reason": f"no_quoted_short_put_near_{short_put_orig}"
+        }
+    long_put, lp_q = _walk_quotes(short_put - wing_width, long_put_dir, is_call=False)
+    if long_put is None or long_put >= short_put:
+        return {
+            "symbol": sym,
+            "skip_reason": f"no_quoted_long_put_near_{short_put - wing_width}"
+        }
+
+    # Compute actual wing widths (may differ from configured if legs walked
+    # different distances — e.g. AMD on Tiger paper, short_call=750, long_call
+    # walks 1 step to 760, actual_wing_call = 10 vs configured 5).
+    actual_wing_call = long_call - short_call
+    actual_wing_put = short_put - long_put
+    actual_wing_width = max(actual_wing_call, actual_wing_put)
 
     # All 4 legs have valid quotes — assemble the legs dict
     legs = {}
@@ -494,17 +531,18 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
         legs[leg_name] = {"mid": q["mid"], "limit": lim, "iv": q.get("iv", 0),
                           "strike": strike, "expiry": expiry}
 
-    # Compute net credit
+    # Compute net credit using actual (possibly variable) wing widths
     sc_lim = legs["short_call"]["limit"]
     lc_lim = legs["long_call"]["limit"]
     sp_lim = legs["short_put"]["limit"]
     lp_lim = legs["long_put"]["limit"]
     net_credit_per_share = sc_lim + sp_lim - lc_lim - lp_lim
-    max_loss_per_contract = wing_width * 100 - net_credit_per_share * 100
+    max_loss_per_contract = actual_wing_width * 100 - net_credit_per_share * 100
 
-    # Sizing (default $500 cap)
+    # Sizing — uses actual_wing_width so the $500 cap is enforced against
+    # the REAL max_loss of the picked structure (not the configured one).
     from bloodaxe_pkg.sizing.caps import size_bloodaxe_ic
-    sz = size_bloodaxe_ic(wing_width=wing_width)
+    sz = size_bloodaxe_ic(wing_width=actual_wing_width)
 
     return {
         "symbol": sym,
