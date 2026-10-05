@@ -224,11 +224,25 @@ def _get_spot(broker, symbol: str, expiry: str | None = None,
 
 def _infer_spot_from_atm_call(broker, symbol: str, expiry: str,
                                strike_step: float) -> float | None:
-    """Find ATM strike, estimate spot as strike + ATM call mid.
+    """Find spot via multi-strike averaging across calls AND puts.
 
-    Uses symbol-specific ATM guesses (calibrated for current price
-    levels — operator can refresh quarterly). Skips the guess loop
-    to keep quote lookups minimal (Tiger paper rate limit).
+    Old behavior (single-strike call derivation) was vulnerable to
+    illiquid single-name quotes (NVDA/AMD/BABA disagreements on
+    2026-10-06). New approach:
+
+    1. Walk 3 strikes around the ATM guess: (center-step, center, center+step)
+    2. For each strike, get BOTH the call and put quotes
+    3. Convert each quote to a spot estimate:
+       - Call: spot ≈ strike + call_mid (intrinsic + time value)
+       - Put:  spot ≈ strike - put_mid  (intrinsic + time value)
+    4. Return the MEDIAN of valid estimates
+
+    Median is robust to one bad quote among 6 (2 sides × 3 strikes).
+    The bars cross-check in _get_spot still catches systemic disagreement.
+
+    Cost: 6 option quotes per symbol vs 1 previously. Tiger paper rate-limit
+    budget is ~60-120 quotes/min; with 6 symbols × 6 quotes = 36 calls
+    per scan cycle, well within budget.
     """
     # Symbol-specific ATM strike guesses (refresh quarterly). Calibrated
     # against Tiger paper latest close on 2026-10-06:
@@ -242,21 +256,34 @@ def _infer_spot_from_atm_call(broker, symbol: str, expiry: str,
         "MSFT": 415, "META": 555, "AMZN": 195, "GOOG": 175,
     }
     guess = ATM_GUESSES.get(symbol, 100)
-    atm = round(guess / strike_step) * strike_step
-    # Just check the ATM strike (skip offset loop for speed)
-    q = broker.get_option_quote(symbol, expiry, atm, is_call=True)
-    if q and q.get("mid", 0) > 0:
-        spot_estimate = atm + q["mid"]
-        if 50 < spot_estimate < 2000:
-            return float(spot_estimate)
-    # Fallback: try ±1 strike in case ATM is off
-    for offset in [-strike_step, strike_step]:
-        q = broker.get_option_quote(symbol, expiry, atm + offset, is_call=True)
+    atm_center = round(guess / strike_step) * strike_step
+
+    estimates: list[float] = []
+    for offset in (-strike_step, 0, strike_step):
+        strike = atm_center + offset
+        # Try call first
+        q = broker.get_option_quote(symbol, expiry, strike, is_call=True)
         if q and q.get("mid", 0) > 0:
-            spot_estimate = (atm + offset) + q["mid"]
-            if 50 < spot_estimate < 2000:
-                return float(spot_estimate)
-    return None
+            spot_est = strike + q["mid"]
+            if 50 < spot_est < 5000:
+                estimates.append(spot_est)
+        # Cross-check with put (independent quote source)
+        q = broker.get_option_quote(symbol, expiry, strike, is_call=False)
+        if q and q.get("mid", 0) > 0:
+            spot_est = strike - q["mid"]
+            if 50 < spot_est < 5000:
+                estimates.append(spot_est)
+
+    if not estimates:
+        return None
+
+    # Median is robust to 1-2 bad quotes among 6 total estimates
+    estimates.sort()
+    n = len(estimates)
+    if n % 2 == 1:
+        return float(estimates[n // 2])
+    # Average the two middle for even-length lists
+    return float((estimates[n // 2 - 1] + estimates[n // 2]) / 2)
 
 
 def _get_atm_iv(broker, symbol: str, spot: float, expiry: str,
