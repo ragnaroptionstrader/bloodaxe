@@ -286,6 +286,51 @@ def _infer_spot_from_atm_call(broker, symbol: str, expiry: str,
     return float((estimates[n // 2 - 1] + estimates[n // 2]) / 2)
 
 
+def _check_chain_depth(
+    broker, symbol: str, expiry: str,
+    target_short_call: float, target_short_put: float,
+    strike_step: float = 5.0, search_range: int = 2,
+) -> tuple[bool, str | None]:
+    """Verify the option chain has data in the expected range for an IC.
+
+    Probes ±``search_range`` strikes (default ±2 = 5 strikes per side) around
+    each target short strike. If EITHER side returns zero quoted strikes
+    (mid > 0), the chain is fundamentally sparse for this underlying and
+    we should skip immediately rather than waste 12+ quote calls in the
+    strike-pair fallback.
+
+    Returns ``(ok, skip_reason)``:
+    - ``ok=True, skip_reason=None`` → chain has data, proceed with fallback
+    - ``ok=False, skip_reason="chain_sparse_calls_at_<X>"`` → skip cleanly
+
+    Cost: 10 quotes per scan (5 calls × 2 sides). Tiger paper budget is
+    ~60-120 quotes/min, so 60 quotes/scan for 6 symbols is comfortable.
+
+    Discovery: AMD on Tiger paper has spot=$632, IV=53%, EM=$117 → correct
+    strikes SP=515/SC=750, but chain only has data for strikes $220-270
+    (stale snapshot from when AMD was cheaper). 2026-10-06.
+    """
+    call_quoted = 0
+    for offset in range(-search_range, search_range + 1):
+        strike = target_short_call + (offset * strike_step)
+        q = broker.get_option_quote(symbol, expiry, strike, is_call=True)
+        if q and q.get("mid", 0) > 0:
+            call_quoted += 1
+    if call_quoted == 0:
+        return False, f"chain_sparse_calls_no_quotes_near_{target_short_call:.0f}"
+
+    put_quoted = 0
+    for offset in range(-search_range, search_range + 1):
+        strike = target_short_put + (offset * strike_step)
+        q = broker.get_option_quote(symbol, expiry, strike, is_call=False)
+        if q and q.get("mid", 0) > 0:
+            put_quoted += 1
+    if put_quoted == 0:
+        return False, f"chain_sparse_puts_no_quotes_near_{target_short_put:.0f}"
+
+    return True, None
+
+
 def _get_atm_iv(broker, symbol: str, spot: float, expiry: str,
                 strike_step: float = 5.0) -> float | None:
     """Get IV from the ATM option (closest strike to spot)."""
@@ -385,6 +430,21 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     long_call = upper + wing_width
     short_put = lower
     long_put = lower - wing_width
+
+    # --- Chain-depth pre-check (added 2026-10-06, AMD discovery) ---
+    # Probe ±2 strikes around each target to verify the chain has data in
+    # the expected range. If either side has ZERO quoted strikes, the chain
+    # is fundamentally sparse and we skip immediately with a clear,
+    # operator-readable reason. Saves the 12+ quote calls that the
+    # strike-pair fallback would otherwise waste on a hopeless chain.
+    chain_ok, skip_chain_reason = _check_chain_depth(
+        broker, sym, expiry,
+        target_short_call=short_call,
+        target_short_put=short_put,
+        strike_step=strike_step,
+    )
+    if not chain_ok:
+        return {"symbol": sym, "skip_reason": skip_chain_reason}
 
     # Get quotes for all 4 legs. If target strike has no quote, walk inward
     # toward spot (up to MAX_STRIKE_FALLBACK steps) to find quoted strikes.
