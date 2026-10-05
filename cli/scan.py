@@ -118,37 +118,108 @@ def _get_broker():
     return TigerBroker(cfg)
 
 
+SPOT_TOLERANCE_ENV_VAR = "BLOODAXE_SPOT_TOLERANCE_PCT"
+DEFAULT_SPOT_TOLERANCE_PCT = 5.0
+"""Max % disagreement between ATM-call-derived spot and get_bars() latest
+close. Above this, refuse the trade — protects against stale ATM_GUESSES,
+underlying splits, broker data inconsistency. Configurable via env var."""
+
+
+def _fetch_bars(broker, symbol: str, limit: int = 5):
+    """Fetch recent daily bars for spot cross-check + skew adjustment.
+
+    Returns a pandas DataFrame sorted ascending by time (most recent last),
+    or None on failure. Caller must handle None gracefully — this function
+    never raises (bars failures are non-fatal, scanner falls back to IV-only).
+    """
+    try:
+        from tigeropen.common.consts import BarPeriod
+        qc = broker._quote_client
+        bars = qc.get_bars(symbol, period=BarPeriod.DAY, limit=limit)
+        if bars is None or len(bars) == 0:
+            return None
+        return bars.sort_values("time").reset_index(drop=True)
+    except Exception:
+        return None
+
+
 def _get_spot(broker, symbol: str, expiry: str | None = None,
-              strike_step: float = 5.0) -> float | None:
-    """Get current spot price for an underlying.
+              strike_step: float = 5.0, *, bars=None):
+    """Get current spot price for an underlying, cross-checked against bars.
+
+    Returns ``(spot, skip_reason, bars_used)`` tuple.
+    - ``spot``: float or None
+    - ``skip_reason``: None on success, str on any failure
+    - ``bars_used``: DataFrame or None (passed through for reuse by skew calc)
 
     Strategy:
     1. Try get_briefs (Tiger paper doesn't expose this — falls back).
     2. Infer from ATM call mid (call_mid ≈ spot - strike for ATM-ish).
-       Faster than full straddle parity, slightly less accurate.
+    3. **Cross-check vs get_bars() latest close** (2026-10-06, BABA spot
+       bug fix). If disagreement > ``BLOODAXE_SPOT_TOLERANCE_PCT`` (default
+       5%), refuse — return ``spot_disagrees_with_bars_<pct>pct``. Catches
+       stale ATM_GUESSES, splits, broker data inconsistency.
+
+    If ``bars`` is supplied (e.g. from a prior fetch in the same scan), we
+    skip the second get_bars call. If bars fetch fails, we FAIL SAFE
+    (return skip_reason="spot_validation_failed") — no spot is better than
+    a wrong spot.
     """
-    # Try briefs first
+    # Step 1: try briefs
+    spot = None
     try:
         tc = broker._trade_client
         briefs = tc.get_briefs([symbol]) if hasattr(tc, "get_briefs") else None
         if briefs and symbol in briefs:
             last = float(briefs[symbol].get("last", 0) or 0)
             if last > 0:
-                return last
+                spot = last
     except Exception:
         pass
 
-    # Fallback: derive spot from ATM call at the next monthly expiry
-    if not expiry:
-        today = date.today()
-        next_exp = _next_expiry(today, weekly=False)
-        if next_exp:
-            spot = _infer_spot_from_atm_call(broker, symbol, next_exp.strftime("%Y%m%d"), strike_step)
-            if spot:
-                return spot
-        return None
+    # Step 2: derive from ATM call mid if briefs failed
+    if spot is None or spot <= 0:
+        if not expiry:
+            today = date.today()
+            next_exp = _next_expiry(today, weekly=False)
+            if next_exp:
+                spot = _infer_spot_from_atm_call(
+                    broker, symbol, next_exp.strftime("%Y%m%d"), strike_step
+                )
+        else:
+            spot = _infer_spot_from_atm_call(broker, symbol, expiry, strike_step)
 
-    return _infer_spot_from_atm_call(broker, symbol, expiry, strike_step)
+    if spot is None or spot <= 0:
+        return None, "no_spot_quote", bars
+
+    # Step 3: cross-check against get_bars() latest close
+    if bars is None:
+        bars = _fetch_bars(broker, symbol, limit=5)
+
+    if bars is None or len(bars) == 0:
+        # Fail safe — no bar data means we can't validate spot. Better to
+        # skip than trade on a possibly-wrong spot.
+        return None, "spot_validation_no_bars", bars
+
+    try:
+        bar_close = float(bars["close"].iloc[-1])
+    except Exception:
+        return None, "spot_validation_bad_bar", bars
+
+    if bar_close <= 0:
+        return None, "spot_validation_zero_bar", bars
+
+    pct_diff = abs(spot - bar_close) / bar_close * 100.0
+    try:
+        tolerance = float(os.environ.get(SPOT_TOLERANCE_ENV_VAR,
+                                            str(DEFAULT_SPOT_TOLERANCE_PCT)))
+    except ValueError:
+        tolerance = DEFAULT_SPOT_TOLERANCE_PCT
+
+    if pct_diff > tolerance:
+        return None, f"spot_disagrees_with_bars_{pct_diff:.1f}pct", bars
+
+    return spot, None, bars
 
 
 def _infer_spot_from_atm_call(broker, symbol: str, expiry: str,
@@ -207,9 +278,11 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     wing_width = underlying_cfg["wing_width"]
     strike_step = underlying_cfg["strike_step"]
 
-    spot = _get_spot(broker, sym)
-    if not spot or spot <= 0:
-        return {"symbol": sym, "skip_reason": "no_spot_quote"}
+    # _get_spot returns (spot, skip_reason, bars_used). We reuse the bars
+    # for the skew-adjustment calc below to avoid a second get_bars call.
+    spot, spot_skip_reason, bars_for_skew = _get_spot(broker, sym)
+    if spot is None or spot <= 0:
+        return {"symbol": sym, "skip_reason": spot_skip_reason or "no_spot_quote"}
 
     expiry_date = _next_expiry(today, weekly=False)  # monthlies
     if not expiry_date:
@@ -232,7 +305,7 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     em = spot * iv * (dte / 365.0) ** 0.5
 
     # --- Realized-vol + downside-skew adjustment (Rule 3.5) ---
-    # Pull ~60 trading days so a 30-day window is robust even with short gaps.
+    # Reuse bars from the cross-check rather than fetching fresh.
     hv_value = None
     dhv_value = None
     skew_ratio = None
@@ -240,11 +313,13 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     em_call_adjusted = None
     bars_available = False
     try:
-        from tigeropen.common.consts import BarPeriod
-        qc = broker._quote_client
-        bars = qc.get_bars(sym, period=BarPeriod.DAY, limit=60)
+        # If we only fetched 5 bars for spot validation, get a wider window
+        # for HV. Cheap (same broker endpoint, same auth).
+        bars = bars_for_skew
+        if bars is not None and len(bars) >= 5 and len(bars) < 31:
+            bars = _fetch_bars(broker, sym, limit=60)
         if bars is not None and len(bars) >= 31:
-            closes = bars.sort_values("time")["close"].dropna().tolist()
+            closes = bars["close"].dropna().tolist()
             from bloodaxe_pkg.expected_move.realized_vol import (
                 compute_hv,
                 compute_downside_hv,
