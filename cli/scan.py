@@ -230,10 +230,15 @@ def _infer_spot_from_atm_call(broker, symbol: str, expiry: str,
     levels — operator can refresh quarterly). Skips the guess loop
     to keep quote lookups minimal (Tiger paper rate limit).
     """
-    # Symbol-specific ATM strike guesses (refresh quarterly)
+    # Symbol-specific ATM strike guesses (refresh quarterly). Calibrated
+    # against Tiger paper latest close on 2026-10-06:
+    #   SPY=$774.83, QQQ=$756.20, IWM=$283.38, NVDA=$238.90,
+    #   AMD=$631.75, BABA=$110.80. The cross-check in _get_spot catches
+    # disagreement > BLOODAXE_SPOT_TOLERANCE_PCT (default 5%), so these
+    # guesses can drift between quarterly refreshes.
     ATM_GUESSES = {
-        "SPY": 770, "QQQ": 485, "IWM": 227,
-        "NVDA": 245, "AMD": 155, "BABA": 180,
+        "SPY": 775, "QQQ": 755, "IWM": 285,
+        "NVDA": 240, "AMD": 630, "BABA": 110,
         "MSFT": 415, "META": 555, "AMZN": 195, "GOOG": 175,
     }
     guess = ATM_GUESSES.get(symbol, 100)
