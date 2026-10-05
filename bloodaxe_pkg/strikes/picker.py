@@ -64,6 +64,10 @@ def pick_strikes(
     strike_step: float = 5.0,
     wing_width: float = 5.0,
     em_multiple: float = 1.0,
+    em_multiple_put: float | None = None,
+    em_multiple_call: float | None = None,
+    em_put: float | None = None,
+    em_call: float | None = None,
 ) -> BloodaxeStrikes:
     """Pick 4 strikes for an iron condor around the expected-move band.
 
@@ -71,19 +75,34 @@ def pick_strikes(
         underlying: ticker symbol.
         expiry: YYYYMMDD format.
         spot: current underlying price.
-        em_dollar: expected move in dollars (1 std dev).
+        em_dollar: expected move in dollars (1 std dev). Used as the
+            default for both sides when ``em_put``/``em_call`` not supplied.
         strike_step: strike price increment (default $5).
         wing_width: width of each wing (default $5).
-        em_multiple: multiplier on EM for short strikes (default 1.0 = at EM).
+        em_multiple: scalar multiplier on EM for short strikes (default 1.0).
+        em_multiple_put: separate scalar for the put side (overrides
+            ``em_multiple`` for puts when supplied). Use this with an
+            adjusted EM to push the short put further OTM.
+        em_multiple_call: separate scalar for the call side (overrides
+            ``em_multiple`` for calls when supplied).
+        em_put: pre-computed downside-adjusted EM in dollars for the put
+            side (overrides em_dollar × em_multiple_put for puts when supplied).
+        em_call: pre-computed upside-adjusted EM in dollars for the call
+            side (overrides em_dollar × em_multiple_call for calls when supplied).
 
     Returns:
         BloodaxeStrikes with 4 strikes snapped to the strike grid.
 
     Logic:
-        short_call = round_up(spot + em_multiple × EM, strike_step)
+        short_call = round_up(spot + em_call_effective, strike_step)
         long_call = short_call + wing_width
-        short_put = round_down(spot - em_multiple × EM, strike_step)
+        short_put = round_down(spot - em_put_effective, strike_step)
         long_put = short_put - wing_width
+
+    The effective EMs are resolved in this priority:
+        1. ``em_put``/``em_call`` (explicit dollar amounts)
+        2. ``em_dollar × em_multiple_put / em_multiple_call`` (separate scalars)
+        3. ``em_dollar × em_multiple`` (symmetric fallback)
     """
     if spot <= 0:
         raise ValueError(f"spot must be positive: {spot}")
@@ -94,8 +113,18 @@ def pick_strikes(
     if strike_step <= 0:
         raise ValueError(f"strike_step must be positive: {strike_step}")
 
-    upper_target = spot + em_multiple * em_dollar
-    lower_target = spot - em_multiple * em_dollar
+    # Resolve effective per-side EMs.
+    put_em_scalar = em_multiple_put if em_multiple_put is not None else em_multiple
+    call_em_scalar = em_multiple_call if em_multiple_call is not None else em_multiple
+    em_put_eff = em_put if em_put is not None else em_dollar * put_em_scalar
+    em_call_eff = em_call if em_call is not None else em_dollar * call_em_scalar
+    if em_put_eff <= 0 or em_call_eff <= 0:
+        raise ValueError(
+            f"resolved em must be positive: em_put={em_put_eff} em_call={em_call_eff}"
+        )
+
+    upper_target = spot + em_call_eff
+    lower_target = spot - em_put_eff
 
     # Snap to strike grid (round up for upper, round down for lower)
     short_call = _round_up(upper_target, strike_step)

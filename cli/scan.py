@@ -230,8 +230,50 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
 
     # Expected move
     em = spot * iv * (dte / 365.0) ** 0.5
-    upper = round(spot + em) // strike_step * strike_step
-    lower = round(spot - em) // strike_step * strike_step
+
+    # --- Realized-vol + downside-skew adjustment (Rule 3.5) ---
+    # Pull ~60 trading days so a 30-day window is robust even with short gaps.
+    hv_value = None
+    dhv_value = None
+    skew_ratio = None
+    em_put_adjusted = None
+    em_call_adjusted = None
+    bars_available = False
+    try:
+        from tigeropen.common.consts import BarPeriod
+        qc = broker._quote_client
+        bars = qc.get_bars(sym, period=BarPeriod.DAY, limit=60)
+        if bars is not None and len(bars) >= 31:
+            closes = bars.sort_values("time")["close"].dropna().tolist()
+            from bloodaxe_pkg.expected_move.realized_vol import (
+                compute_hv,
+                compute_downside_hv,
+                compute_downside_skew_ratio,
+                skew_adjusted_em,
+                adjusted_call_em,
+            )
+            hv_value = compute_hv(closes, window=30)
+            dhv_value = compute_downside_hv(closes, window=30)
+            skew_ratio = compute_downside_skew_ratio(closes, window=30)
+            em_put_adjusted = skew_adjusted_em(
+                spot=spot, iv=iv, closes=closes, dte=dte, skew_safety=1.0
+            )
+            em_call_adjusted = adjusted_call_em(
+                spot=spot, iv=iv, closes=closes, dte=dte
+            )
+            bars_available = True
+    except Exception:
+        # Graceful fallback — leave values None, strike picker uses IV-only.
+        pass
+
+    # Resolve effective per-side EMs (Rule 3.5) with symmetric fallback.
+    em_put_used = em_put_adjusted if (bars_available and em_put_adjusted) else em
+    em_call_used = em_call_adjusted if (bars_available and em_call_adjusted) else em
+
+    short_call_target = spot + em_call_used
+    short_put_target = spot - em_put_used
+    upper = round(short_call_target) // strike_step * strike_step
+    lower = round(short_put_target) // strike_step * strike_step
     short_call = upper
     long_call = upper + wing_width
     short_put = lower
@@ -276,6 +318,19 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
         "expiry": expiry,
         "expiry_date": expiry_date.isoformat(),
         "expected_move": em,
+        # Rule 3.5 skew-adjustment diagnostics — operator-facing.
+        # ``bars_available`` False means the scanner fell back to IV-only.
+        "skew_adjustment": {
+            "bars_available": bars_available,
+            "hv_30d": hv_value,
+            "downside_hv_30d": dhv_value,
+            "skew_ratio": skew_ratio,
+            "em_iv": em,
+            "em_put_used": em_put_used,
+            "em_call_used": em_call_used,
+            "em_put_adjusted": em_put_adjusted,
+            "em_call_adjusted": em_call_adjusted,
+        },
         "strikes": {
             "short_put": short_put, "long_put": long_put,
             "short_call": short_call, "long_call": long_call,
