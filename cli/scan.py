@@ -386,22 +386,51 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
     short_put = lower
     long_put = lower - wing_width
 
-    # Get quotes for all 4 legs
+    # Get quotes for all 4 legs. If target strike has no quote, walk inward
+    # toward spot (up to MAX_STRIKE_FALLBACK steps) to find quoted strikes.
+    # Keeps wing_width intact — both legs of a side shift together.
+    MAX_STRIKE_FALLBACK = 3
+
+    def _find_leg_pair(target_short, is_call):
+        """Walk inward from target_short until both legs (target, target+wing)
+        have valid quotes. Returns (short_strike, long_strike, short_q, long_q)
+        or (None, None, None, None) on failure."""
+        direction = -1 if is_call else 1  # calls walk down, puts walk up
+        for step in range(MAX_STRIKE_FALLBACK + 1):
+            sc = target_short + (step * direction * strike_step)
+            lc = sc + wing_width if is_call else sc - wing_width
+            sc_q = broker.get_option_quote(sym, expiry, sc, is_call=is_call)
+            lc_q = broker.get_option_quote(sym, expiry, lc, is_call=is_call)
+            if (sc_q and sc_q.get("mid", 0) > 0 and
+                    lc_q and lc_q.get("mid", 0) > 0):
+                return sc, lc, sc_q, lc_q
+        return None, None, None, None
+
+    sc, lc, sc_q, lc_q = _find_leg_pair(short_call, is_call=True)
+    if sc is None:
+        return {
+            "symbol": sym,
+            "skip_reason": f"no_quote_for_call_pair_near_{short_call}"
+        }
+    short_call, long_call = sc, lc
+
+    sp, lp, sp_q, lp_q = _find_leg_pair(short_put, is_call=False)
+    if sp is None:
+        return {
+            "symbol": sym,
+            "skip_reason": f"no_quote_for_put_pair_near_{short_put}"
+        }
+    short_put, long_put = sp, lp
+
+    # All 4 legs have valid quotes — assemble the legs dict
     legs = {}
-    for leg_name, is_call, strike in [
-        ("short_call", True, short_call),
-        ("long_call", True, long_call),
-        ("short_put", False, short_put),
-        ("long_put", False, long_put),
+    for leg_name, q, strike in [
+        ("short_call", sc_q, short_call),
+        ("long_call", lc_q, long_call),
+        ("short_put", sp_q, short_put),
+        ("long_put", lp_q, long_put),
     ]:
-        q = broker.get_option_quote(sym, expiry, strike, is_call=is_call)
-        if not q or q.get("mid", 0) <= 0:
-            return {"symbol": sym, "skip_reason": f"no_quote_for_{leg_name}_{strike}"}
-        # Apply 1.02 × mid markup with proper tick rounding
-        if is_call:
-            lim = _round_leg_tick(q["mid"] * 1.02, sym)
-        else:
-            lim = _round_leg_tick(q["mid"] * 1.02, sym)
+        lim = _round_leg_tick(q["mid"] * 1.02, sym)
         legs[leg_name] = {"mid": q["mid"], "limit": lim, "iv": q.get("iv", 0),
                           "strike": strike, "expiry": expiry}
 
