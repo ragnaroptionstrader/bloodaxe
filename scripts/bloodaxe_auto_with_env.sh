@@ -3,6 +3,16 @@
 #
 # Sets venv + dotenv + paths before invoking bloodaxe_auto.py.
 # Mirrors vidar_auto_with_env.sh structure for cron parity.
+#
+# Usage:
+#   bash bloodaxe_auto_with_env.sh pre_build        # 9:00 ET — writes spec
+#   bash bloodaxe_auto_with_env.sh open             # 9:35 ET — places trade
+#   bash bloodaxe_auto_with_env.sh open --dry-run   # VERIFY without placing
+#   bash bloodaxe_auto_with_env.sh exit_review      # every 20m RTH
+#
+# --dry-run flag is passed through to the python orchestrator, which then
+# skips the actual broker.place_combo_iron_condor() call. Use this to verify
+# the open phase logic without risking a trade on the live broker.
 
 set -euo pipefail
 
