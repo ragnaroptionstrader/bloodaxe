@@ -325,6 +325,7 @@ def phase_exit_review(dry_run: bool = False) -> int:
         if reason is not None:
             _log(f"  → {sym} EXIT {reason.value}: cost=${cost_to_close:.0f} credit=${entry_credit:.0f} dte={dte_remaining}")
             # Place the close (buy back the IC) — for now just log it
+            realized_pnl = entry_credit - cost_to_close
             _audit({
                 "stage": "bloodaxe_exit",
                 "underlying": sym,
@@ -347,6 +348,27 @@ def phase_exit_review(dry_run: bool = False) -> int:
                 realized_pnl=entry_credit - cost_to_close,
                 notes=f"dte_remaining={dte_remaining}",
             )
+
+            # Send exit email alert (operator-facing — every closed IC gets a heads-up)
+            try:
+                sys.path.insert(0, "/home/freya/workspace/scripts")
+                from send_bloodaxe_exit_alert import send_exit_alert
+                send_exit_alert(
+                    underlying=sym,
+                    order_id=pos["order_id"],
+                    exit_reason=reason.value,
+                    cost_to_close=cost_to_close,
+                    entry_credit=entry_credit,
+                    realized_pnl=realized_pnl,
+                    dte_remaining=dte_remaining,
+                    short_put=s["short_put"],
+                    long_put=s["long_put"],
+                    short_call=s["short_call"],
+                    long_call=s["long_call"],
+                    current_spot=current_spot,
+                )
+            except Exception as e:
+                _log(f"  ! exit-alert email failed (non-fatal): {e!r}")
         else:
             _log(f"  → {sym} HOLD: cost=${cost_to_close:.0f} credit=${entry_credit:.0f} dte={dte_remaining}")
 
