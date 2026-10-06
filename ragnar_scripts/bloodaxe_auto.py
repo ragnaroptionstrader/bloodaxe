@@ -266,22 +266,29 @@ def phase_exit_review(dry_run: bool = False) -> int:
     for pos in open_positions:
         sym = pos["underlying"]
         s = pos["strikes"]
-        # Get current quotes for short strikes (close = buy back)
-        # We only need the short side to estimate cost-to-close
+        # Get current quotes for ALL 4 legs (close = buy back shorts,
+        # sell longs — longs have value that offsets the cost).
         try:
             sc_q = broker.get_option_quote(sym, pos["expiry"], s["short_call"], is_call=True)
+            lc_q = broker.get_option_quote(sym, pos["expiry"], s["long_call"], is_call=True)
             sp_q = broker.get_option_quote(sym, pos["expiry"], s["short_put"], is_call=False)
+            lp_q = broker.get_option_quote(sym, pos["expiry"], s["long_put"], is_call=False)
         except Exception as e:
             _log(f"  ! quote error for {sym}: {e}")
             continue
-        if not sc_q or not sp_q:
+        if not sc_q or not lc_q or not sp_q or not lp_q:
             continue
-        # Cost-to-close per share = (short_call_mid + short_put_mid) (to buy back)
-        # But actually for an IC, closing = debit at current spread.
-        # Approximation: cost_to_close = (short_call_mid + short_put_mid) - entry_credit
-        # For now: total cost_to_close = short_call_mid + short_put_mid (this is approximate)
-        # Better: ask to buy back = (short_call_ask + short_put_ask) - entry_credit
-        cost_to_close_per_share = sc_q["ask"] + sp_q["ask"]
+
+        # CORRECT cost-to-close for an iron condor (fixed 2026-10-06):
+        # - Shorts cost money to close: buy back at ASK
+        # - Longs have value when closing: sell at BID
+        # Net cost = short_close - long_proceeds
+        # The previous formula only summed short-side asks, ignoring the
+        # long-wing proceeds — phantom exits were triggered 10 minutes
+        # after open because the "cost" was overstated.
+        short_close_per_share = sc_q["ask"] + sp_q["ask"]
+        long_proceeds_per_share = lc_q["bid"] + lp_q["bid"]
+        cost_to_close_per_share = short_close_per_share - long_proceeds_per_share
         cost_to_close = cost_to_close_per_share * 100  # $ per contract
         entry_credit = pos.get("entry_credit_per_share", 0) * 100
         dte_remaining = (datetime.strptime(pos["expiry"], "%Y%m%d").date() - date.today()).days
