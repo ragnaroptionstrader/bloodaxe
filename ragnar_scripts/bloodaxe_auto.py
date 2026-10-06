@@ -99,8 +99,39 @@ def phase_open(dry_run: bool = False) -> int:
         _log(f"  ! no picked candidate in spec (skip_reasons: {spec.get('skip_reasons', [])})")
         return 0
 
+    sym = best["symbol"]
+
+    # GUARDS (added 2026-10-06 — operator directive to actually place trades)
+    # Prevent double-up on existing positions, exceed daily cap, exceed
+    # concurrent position cap. Read journal for open positions.
+    sys.path.insert(0, BLOODAXE_HOME)
+    from bloodaxe_pkg.journal.log import read_recent
+
+    recent = read_recent(n=200)
+    closed_order_ids = set()
+    open_positions = []
+    for ev in recent:
+        if ev.get("event") == "open":
+            open_positions.append(ev)
+        elif ev.get("event") == "exit":
+            closed_order_ids.add(ev.get("order_id", ""))
+    open_positions = [p for p in open_positions
+                      if p.get("order_id") not in closed_order_ids]
+
+    # Guard 1: don't open if we already have a position for this symbol
+    same_symbol = [p for p in open_positions if p.get("underlying") == sym]
+    if same_symbol:
+        _log(f"  ! already have {sym} position: oid={same_symbol[0].get('order_id')} — skipping")
+        return 0
+
+    # Guard 2: don't open if we've reached max_concurrent (5 by default)
+    from bloodaxe_pkg.sizing.caps import DEFAULT_MAX_CONCURRENT_POSITIONS
+    if len(open_positions) >= DEFAULT_MAX_CONCURRENT_POSITIONS:
+        _log(f"  ! at max concurrent ({len(open_positions)}/{DEFAULT_MAX_CONCURRENT_POSITIONS}) — skipping")
+        return 0
+
     if dry_run:
-        _log(f"  DRY RUN: would place {best['symbol']} IC at strikes {best['strikes']}")
+        _log(f"  DRY RUN: would place {sym} IC at strikes {best['strikes']}")
         return 0
 
     # Real placement
@@ -115,7 +146,6 @@ def phase_open(dry_run: bool = False) -> int:
     )
     broker = TigerBroker(cfg)
 
-    sym = best["symbol"]
     expiry = best["expiry"]
     s = best["strikes"]
     l = best["limits"]
