@@ -541,8 +541,13 @@ def _select_pick(underlying_cfg: dict, broker, today: date) -> dict | None:
 
     # Sizing — uses actual_wing_width so the $500 cap is enforced against
     # the REAL max_loss of the picked structure (not the configured one).
+    # Passes net_credit so max_loss accounts for credit already collected
+    # (wing=10 - credit=3.26 = 6.74 wide → $674 max_loss, fits $750 cap).
     from bloodaxe_pkg.sizing.caps import size_bloodaxe_ic
-    sz = size_bloodaxe_ic(wing_width=actual_wing_width)
+    sz = size_bloodaxe_ic(
+        wing_width=actual_wing_width,
+        net_credit_per_share=net_credit_per_share,
+    )
 
     return {
         "symbol": sym,
